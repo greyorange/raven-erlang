@@ -47,6 +47,7 @@ capture(Message, Params0) ->
     Cfg = get_config(),
     Params1 = [{tags, get_tags()} | Params0],
     Params2 = maybe_append_release(Params1),
+    Params3 = maybe_append_environment(Params2),
     Document = {[
         {event_id, event_id_i()},
         {project, unicode:characters_to_binary(Cfg#cfg.project)},
@@ -70,7 +71,7 @@ capture(Message, Params0) ->
                 {extra, {[{Key, term_to_json_i(Value)} || {Key, Value} <- Tags]}};
             ({Key, Value}) ->
                 {Key, term_to_json_i(Value)}
-        end, Params2)
+        end, Params3)
     ]},
     Timestamp = integer_to_list(unix_timestamp_i()),
     Body = base64:encode(zlib:compress(jsone:encode(Document, ?JSONE_OPTS))),
@@ -131,6 +132,12 @@ get_tags() ->
 maybe_append_release(Params) ->
     case application:get_env(?APP, release) of
         {ok, Release} -> [{release, Release} | Params];
+        undefined -> Params
+    end.
+
+maybe_append_environment(Params) ->
+    case application:get_env(?APP, environment) of
+        {ok, Environment} -> [{environment, Environment} | Params];
         undefined -> Params
     end.
 
