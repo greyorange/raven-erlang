@@ -23,8 +23,7 @@ handle_call(_, State) ->
     {ok, ok, State}.
 
 handle_event({error, _, {Pid, Format, Data}}, State) ->
-    {Message, Details} = parse_message(error, Pid, Format, Data),
-    raven:capture(Message, Details),
+    capture(parse_message(error, Pid, Format, Data)),
     {ok, State};
 handle_event({error_report, _, {Pid, Type, Report}}, State) ->
     case should_send_report(Type, Report) of
@@ -67,6 +66,11 @@ code_change(_, State, _) ->
 terminate(_, _) ->
     ok.
 
+%% @private
+capture(mask) ->
+    ok;
+capture({Message, Details}) ->
+    raven:capture(Message, Details).
 
 %% @private
 -spec get_config() -> #config{}.
@@ -105,6 +109,41 @@ parse_message(error = Level, Pid, "** Generic server " ++ _, [Name, LastMessage,
             {reason, Reason}
         ]}
     ]};
+%% OTP 20 crash reports where the client pid is dead don't include the stacktrace
+parse_message(error = Level, Pid, "** Generic server " ++ _, [Name, LastMessage, State, Reason, Client]) ->
+	%% gen_server terminate
+	{Exception, Stacktrace} = parse_reason(Reason),
+	{format_exit(gen_server, Name, Reason), [
+		{level, Level},
+		{exception, Exception},
+		{stacktrace, Stacktrace},
+		{extra, [
+			{name, Name},
+			{pid, Pid},
+			{last_message, LastMessage},
+			{state, State},
+			{reason, Reason},
+			{client, Client}
+		]}
+	]};
+%% OTP 20 crash reports contain the pid of the client and stacktrace
+parse_message(error = Level, Pid, "** Generic server " ++ _, [Name, LastMessage, State, Reason, Client, ClientStacktrace]) ->
+	%% gen_server terminate
+	{Exception, Stacktrace} = parse_reason(Reason),
+	{format_exit(gen_server, Name, Reason), [
+		{level, Level},
+		{exception, Exception},
+		{stacktrace, Stacktrace},
+		{extra, [
+			{name, Name},
+			{pid, Pid},
+			{last_message, LastMessage},
+			{state, State},
+			{reason, Reason},
+			{client, Client},
+			{client_stacktrace, ClientStacktrace}
+		]}
+	]};
 parse_message(error = Level, Pid, "** State machine " ++ _, [Name, LastMessage, StateName, State, Reason]) ->
     %% gen_fsm terminate
     {Exception, Stacktrace} = parse_reason(Reason),
@@ -121,6 +160,41 @@ parse_message(error = Level, Pid, "** State machine " ++ _, [Name, LastMessage, 
             {reason, Reason}
         ]}
     ]};
+parse_message(error = Level, Pid, "** State machine " ++ _, [Name, LastEvent, {StateName, StateData}, Class, Reason, CallbackMode, Stacktrace]) ->
+	%% gen_statem terminate
+	{format_exit(gen_statem, Name, Reason), [
+		{level, Level},
+		{exception, {Class, Reason}},
+		{stacktrace, Stacktrace},
+		{extra, [
+			{name, Name},
+			{pid, Pid},
+			{last_event, LastEvent},
+			{state_name, StateName},
+			{state_data, StateData},
+			{callback_mode, CallbackMode},
+			{reason, Reason}
+		]}
+	]};
+parse_message(error = Level, Pid, "** State machine " ++ _, [Name, LastEvent, [{StateName, StateData}], Class, Reason, CallbackMode, Stacktrace]) ->
+	%% gen_statem terminate
+	%% sometimes gen_statem wraps its statename/data in a list for some reason???
+	{format_exit(gen_statem, Name, Reason), [
+		{level, Level},
+		{exception, {Class, Reason}},
+		{stacktrace, Stacktrace},
+		{extra, [
+			{name, Name},
+			{pid, Pid},
+			{last_event, LastEvent},
+			{state_name, StateName},
+			{state_data, StateData},
+			{callback_mode, CallbackMode},
+			{reason, Reason}
+		]}
+	]};
+parse_message(_Level, _Pid, "** gen_event handler " ++ _, [error_logger_lager_h, error_logger, _LastMessage, _State, _Reason]) ->
+    mask;
 parse_message(error = Level, Pid, "** gen_event handler " ++ _, [ID, Name, LastMessage, State, Reason]) ->
     %% gen_event terminate
     {Exception, Stacktrace} = parse_reason(Reason),
@@ -152,6 +226,23 @@ parse_message(error = Level, Pid, "** Generic process " ++ _, [Name, LastMessage
             {reason, Reason}
         ]}
     ]};
+parse_message(error = Level, Pid, "Error in process " ++ _,
+              [Name, Node, [ {reason, Reason}
+                           , {mfa, {Handler, _, _}}
+                           , {stacktrace, Stacktrace}
+                           | Extras ]]) ->
+	%% cowboy_handler terminate
+	{format_exit(process, Name, {Reason, Stacktrace}), [
+		{level, Level},
+		{exception, {exit, Reason}},
+		{stacktrace, Stacktrace},
+		{extra, [
+			{name, Name},
+			{pid, Pid},
+			{node, Node},
+			{handler, Handler} | Extras
+		]}
+    ]};
 parse_message(error = Level, Pid, "Error in process " ++ _, [Name, Node, Reason]) ->
     %% process terminate
     {Exception, Stacktrace} = parse_reason(Reason),
@@ -166,21 +257,74 @@ parse_message(error = Level, Pid, "Error in process " ++ _, [Name, Node, Reason]
             {reason, Reason}
         ]}
     ]};
-parse_message(error = Level, Pid, "Ranch listener " ++ _, [Name, Protocol, RefPid, Reason]) ->
-    %% ranch connection terminated
-    {Exception, Stacktrace} = parse_reason(Reason),
-    {format_exit(Protocol, Name, Reason), [
-        {level, Level},
-        {exception, Exception},
-        {stacktrace, Stacktrace},
-        {extra, [
-            {name, Name},
-            {pid, Pid},
-            {ref_pid, RefPid},
-            {protocol, Protocol},
-            {reason, Reason}
-        ]}
-    ]};
+parse_message(_Level, _Pid, "Ranch listener " ++ _, _) ->
+    mask;
+%% --- General ---
+parse_message(Level, Pid, "Error: ~p" ++ _ = Format, [{failed, _Reason} = Exception | _] = Data) ->
+	{format(Format, Data), [
+		{level, Level},
+		{exception, Exception},
+		{extra, [
+			{pid, Pid}
+		]}
+	]};
+parse_message(Level, Pid, "Error: ~p" ++ _ = Format, [{failed, Reason, Extras} | Rest])
+		when is_list(Extras) ->
+	{format(Format, [{failed, Reason} | Rest]), [
+		{level, Level},
+		{exception, {failed, Reason}},
+		{extra, [
+			{pid, Pid} |
+			[ {Key, Value} || {Key, Value} <- Extras, is_atom(Key) ]
+		]}
+	]};
+parse_message(Level, Pid, "Exception: ~p\n"
+						  "Extras: ~p" = Format,
+			  [{{Class, Reason}, [{_, _, _, _} | _] = Stacktrace}, Extras])
+		when Class =:= exit; Class =:= error; Class =:= throw ->
+	{format(Format, [{Class, Reason}, Extras]), [
+		{level, Level},
+		{exception, {Class, Reason}},
+		{stacktrace, Stacktrace},
+		{extra, [
+			{pid, Pid} | [ {Key, Value} || {Key, Value} <- Extras, is_atom(Key) ]
+		]}
+	]};
+%% --- Brod ---
+parse_message(_Level, Pid, "Produce error ~s-~B Offset: ~B Error: ~p" = Format,
+			  [Topic, _Partition, _Offset, ErrorCode] = Data) ->
+	Extra = "\nRetriable errors will be retried, actual failures will result in "
+			"an exit. Look for 'producer_down'.",
+	{format(Format ++ Extra, Data), [
+		{level, warning},
+		{exception, {failed, {brod, produce, Topic, ErrorCode}}},
+		{extra, [
+			{pid, Pid},
+			{data, Data}
+		]}
+	]};
+parse_message(Level, Pid, "~p [~p] ~p is terminating\nreason: ~p~n" = Format,
+	          [_Module, _Pid, _ClientId, Reason] = Data) ->
+	{Exception, Stacktrace} = parse_reason(Reason),
+	{format(Format, Data), [
+		{level, Level},
+		{exception, Exception},
+		{stacktrace, Stacktrace},
+		{extra, [
+			{pid, Pid},
+			{data, Data}
+		]}
+	]};
+parse_message(Level, Pid, "~p ~p terminating, reason:\n~p" = Format,
+	          [_Module, _Pid, Reason] = Data) ->
+	{format(Format, Data), [
+		{level, Level},
+		{exception, {exit, Reason}},
+		{extra, [
+			{pid, Pid},
+			{data, Data}
+		]}
+	]};
 parse_message(error = Level, Pid, "** Task " ++ _, [TaskPid, RefPid, Fun, FunArgs, Reason]) ->
   {Exception, Stacktrace} = parse_reason(Reason),
     {format_exit("Task", TaskPid, Reason), [
@@ -208,18 +352,22 @@ parse_message(Level, Pid, Format, Data) ->
 -spec should_send_report(report_type(), error_logger:report()) -> boolean().
 should_send_report(supervisor_report, Report) ->
     #config{filter = Mod} = get_config(),
-    case erlang:function_exported(Mod, should_send_supervisor_report, 3) of
-        true ->
+    case Mod of
+        undefined -> true;
+        _ ->
             Mod:should_send_supervisor_report(
                 proplists:get_value(supervisor, Report),
                 proplists:get_value(reason, Report),
                 proplists:get_value(errorContext, Report)
-            );
-        false ->
-            true
+            )
     end;
-should_send_report(_, _) -> true.
-
+should_send_report(crash_report, Report) ->
+    #config{filter = Mod} = get_config(),
+    case Mod of
+        undefined -> true;
+        _ ->
+            Mod:should_send_crash_report(Report)
+    end.
 
 %% @private
 parse_report(Level, Pid, Type, Report) ->
@@ -440,6 +588,10 @@ format_reason({bad_return_value, Val}) ->
     ["bad return value ", format_term(Val)];
 format_reason({{bad_return_value, Val}, Trace}) ->
     ["bad return value ", format_term(Val), " in ", format_mfa(Trace)];
+    format_reason({bad_return_from_state_function, Val}) ->
+	["bad return value from state function ", format_term(Val)];
+format_reason({{bad_return_from_state_function, Val}, Trace}) ->
+	["bad return value from state function ", format_term(Val), " in ", format_mfa(Trace)];
 format_reason({{badrecord, Record}, Trace}) ->
     ["bad record ", format_term(Record), " in ", format_mfa(Trace)];
 format_reason({{case_clause, Value}, Trace}) ->
@@ -516,7 +668,9 @@ format_mfa_erlang({M, F, A}) when is_list(A) ->
   {Format, Args} = format_args(A, [], []),
     format("~w:~w(" ++ Format ++ ")", [M, F | Args]);
 format_mfa_erlang({M, F, A}) when is_integer(A) ->
-  format("~w:~w/~w", [M, F, A]).
+  format("~w:~w/~w", [M, F, A]);
+format_mfa_erlang(Term) ->
+    format_term(Term).
 
 %% @private
 format_args([], FormatAcc, ArgsAcc) ->
